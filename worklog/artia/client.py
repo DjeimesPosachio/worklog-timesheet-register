@@ -5,6 +5,10 @@ returns the same ``Auth`` type as the documented client-credentials one but
 needs no organization admin. Every authenticated request carries the
 ``organizationId`` header; without it the API answers "Organização não
 encontrada" regardless of the query.
+
+Callers running a mutation must pass ``retry_on_failure=False``: a timeout or a
+5xx after the server already committed would otherwise resend the mutation and
+duplicate the record.
 """
 
 from __future__ import annotations
@@ -48,11 +52,12 @@ class ArtiaClient:
     ) -> None:
         if not (email and password):
             raise ArtiaError("E-mail e senha do Artia são obrigatórios.")
+        if not organization_id:
+            raise ArtiaError("O id da organização do Artia é obrigatório.")
         self.base_url = _validate_base_url(base_url or DEFAULT_API)
         self._email = email
         self._password = password
         self._organization_id = organization_id
-        self._timeout = timeout
         self._token: str | None = None
         self._last_request = 0.0
         self._http = httpx.Client(timeout=httpx.Timeout(timeout))
@@ -72,10 +77,22 @@ class ArtiaClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def execute(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+    def execute(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        retry_on_failure: bool = True,
+    ) -> dict[str, Any]:
         if self._token is None:
             self._authenticate()
-        return self._send(query, variables, authenticated=True, allow_renew=True)
+        return self._send(
+            query,
+            variables,
+            authenticated=True,
+            allow_renew=True,
+            retries=len(BACKOFFS) if retry_on_failure else 0,
+        )
 
     def _authenticate(self) -> None:
         data = self._send(
@@ -83,6 +100,7 @@ class ArtiaClient:
             {"email": self._email, "password": self._password},
             authenticated=False,
             allow_renew=False,
+            retries=len(BACKOFFS),
         )
         token = (data.get("authenticationByEmail") or {}).get("token")
         if not token:
@@ -104,6 +122,7 @@ class ArtiaClient:
         *,
         authenticated: bool,
         allow_renew: bool,
+        retries: int,
     ) -> dict[str, Any]:
         attempt = 0
         renewed = False
@@ -116,7 +135,7 @@ class ArtiaClient:
                     json={"query": query, "variables": variables or {}},
                 )
             except httpx.HTTPError as exc:
-                if attempt < len(BACKOFFS):
+                if attempt < retries:
                     time.sleep(BACKOFFS[attempt])
                     attempt += 1
                     continue
@@ -129,7 +148,7 @@ class ArtiaClient:
                 continue
 
             if response.status_code == 429 or response.status_code >= 500:
-                if attempt < len(BACKOFFS):
+                if attempt < retries:
                     time.sleep(BACKOFFS[attempt])
                     attempt += 1
                     continue
@@ -137,7 +156,13 @@ class ArtiaClient:
             if response.status_code >= 400:
                 raise self._status_error(response.status_code)
 
-            body = response.json()
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise ArtiaError(
+                    "O Artia devolveu uma resposta que não é JSON.",
+                    status=response.status_code,
+                ) from exc
             errors = body.get("errors")
             if errors:
                 message = str(errors[0].get("message", "Erro do Artia."))
