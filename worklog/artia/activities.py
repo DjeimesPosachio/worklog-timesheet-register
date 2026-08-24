@@ -3,6 +3,12 @@
 The number written in the spreadsheet is a prefix of the activity *title*, not
 its id, so resolving an entry always requires walking the folders once and
 indexing by that prefix.
+
+Two failure modes get explicit treatment because both would otherwise route
+hours to the wrong activity in silence: a parent folder legitimately has no
+activities and is skipped, while any other API failure aborts the walk instead
+of yielding a partial index; and a number claimed by more than one activity is
+recorded as ambiguous rather than resolved to whichever came first.
 """
 
 from __future__ import annotations
@@ -12,6 +18,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from worklog.errors import ArtiaError
+
+EMPTY_FOLDER_MESSAGE = "não possui atividades"
 
 _LIST_FOLDERS = """
 query ListFolders($accountId: Int!) {
@@ -50,6 +58,12 @@ class Activity:
     folder_name: str
 
 
+@dataclass(frozen=True)
+class ActivityIndex:
+    by_number: dict[str, Activity]
+    ambiguous: frozenset[str]
+
+
 def list_folders(client: Executor, account_id: str) -> list[Folder]:
     rows = client.execute(_LIST_FOLDERS, {"accountId": int(account_id)}).get(
         "listingFolders"
@@ -77,20 +91,28 @@ def _all_activities(client: Executor, account_id: str) -> list[Activity]:
     for folder in list_folders(client, account_id):
         try:
             activities.extend(list_activities(client, account_id, folder))
-        except ArtiaError:
-            continue
+        except ArtiaError as exc:
+            if EMPTY_FOLDER_MESSAGE not in exc.message.casefold():
+                raise
     return activities
 
 
 def build_index(
     client: Executor, account_id: str, pattern: re.Pattern[str]
-) -> dict[str, Activity]:
-    index: dict[str, Activity] = {}
+) -> ActivityIndex:
+    by_number: dict[str, Activity] = {}
+    ambiguous: set[str] = set()
     for activity in _all_activities(client, account_id):
         match = pattern.match(activity.title)
-        if match:
-            index.setdefault(match.group(1), activity)
-    return index
+        if not match:
+            continue
+        number = match.group(1)
+        known = by_number.get(number)
+        if known is None:
+            by_number[number] = activity
+        elif known.id != activity.id:
+            ambiguous.add(number)
+    return ActivityIndex(by_number=by_number, ambiguous=frozenset(ambiguous))
 
 
 def search(client: Executor, account_id: str, term: str) -> list[Activity]:
